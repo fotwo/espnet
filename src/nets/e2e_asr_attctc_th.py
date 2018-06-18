@@ -141,7 +141,10 @@ def pad_list(xs, pad_value=float("nan")):
     assert isinstance(xs[0], Variable)
     n_batch = len(xs)
     max_len = max(x.size(0) for x in xs)
-    pad = Variable(xs[0].data.new(n_batch, max_len, * xs[0].size()[1:]).zero_() + pad_value)
+    pad = Variable(
+        xs[0].data.new(
+            n_batch, max_len, * xs[0].size()[1:]).zero_() + pad_value,
+        volatile=xs[0].volatile)
     for i in range(n_batch):
         pad[i, :xs[i].size(0)] = xs[i]
     return pad
@@ -183,7 +186,7 @@ class E2E(torch.nn.Module):
         # label smoothing info
         if args.lsm_type:
             logging.info("Use label smoothing with " + args.lsm_type)
-            labeldist = label_smoothing_dist(odim, args.lsm_type, transcript=args.train_label)
+            labeldist = label_smoothing_dist(odim, args.lsm_type, transcript=args.train_json)
         else:
             labeldist = None
 
@@ -209,9 +212,9 @@ class E2E(torch.nn.Module):
             self.att = AttLocRec(args.eprojs, args.dunits,
                                  args.adim, args.aconv_chans, args.aconv_filts)
         elif args.atype == 'coverage':
-            self.att = AttCov(args.eprojs, args.dunits, args.adim, args.awin)
+            self.att = AttCov(args.eprojs, args.dunits, args.adim)
         elif args.atype == 'coverage_location':
-            self.att = AttCovLoc(args.eprojs, args.dunits, args.adim, args.awin,
+            self.att = AttCovLoc(args.eprojs, args.dunits, args.adim,
                                  args.aconv_chans, args.aconv_filts)
         elif args.atype == 'multi_head_dot':
             self.att = AttMultiHeadDot(args.eprojs, args.dunits,
@@ -275,7 +278,7 @@ class E2E(torch.nn.Module):
         # utt list of frame x dim
         xs = [d[1]['feat'] for d in data]
         # remove 0-output-length utterances
-        tids = [d[1]['tokenid'].split() for d in data]
+        tids = [d[1]['output'][0]['tokenid'].split() for d in data]
         filtered_index = filter(lambda i: len(tids[i]) > 0, range(len(xs)))
         sorted_index = sorted(filtered_index, key=lambda i: -len(xs[i]))
         if len(sorted_index) != len(xs):
@@ -285,12 +288,18 @@ class E2E(torch.nn.Module):
         # utt list of olen
         ys = [np.fromiter(map(int, tids[i]), dtype=np.int64)
               for i in sorted_index]
-        ys = [to_cuda(self, Variable(torch.from_numpy(y))) for y in ys]
+        if self.training:
+            ys = [to_cuda(self, Variable(torch.from_numpy(y))) for y in ys]
+        else:
+            ys = [to_cuda(self, Variable(torch.from_numpy(y), volatile=True)) for y in ys]
 
         # subsample frame
         xs = [xx[::self.subsample[0], :] for xx in xs]
         ilens = np.fromiter((xx.shape[0] for xx in xs), dtype=np.int64)
-        hs = [to_cuda(self, Variable(torch.from_numpy(xx))) for xx in xs]
+        if self.training:
+            hs = [to_cuda(self, Variable(torch.from_numpy(xx))) for xx in xs]
+        else:
+            hs = [to_cuda(self, Variable(torch.from_numpy(xx), volatile=True)) for xx in xs]
 
         # 1. encoder
         xpad = pad_list(hs)
@@ -344,6 +353,46 @@ class E2E(torch.nn.Module):
         if prev:
             self.train()
         return y
+
+    def calculate_all_attentions(self, data):
+        '''E2E attention calculation
+
+        :param list data: list of dicts of the input (B)
+        :return: attention weights with the following shape,
+            1) multi-head case => attention weights (B, H, Lmax, Tmax),
+            2) other case => attention weights (B, Lmax, Tmax).
+         :rtype: float ndarray
+        '''
+        # utt list of frame x dim
+        xs = [d[1]['feat'] for d in data]
+
+        # remove 0-output-length utterances
+        tids = [d[1]['output'][0]['tokenid'].split() for d in data]
+        filtered_index = filter(lambda i: len(tids[i]) > 0, range(len(xs)))
+        sorted_index = sorted(filtered_index, key=lambda i: -len(xs[i]))
+        if len(sorted_index) != len(xs):
+            logging.warning('Target sequences include empty tokenid (batch %d -> %d).' % (
+                len(xs), len(sorted_index)))
+        xs = [xs[i] for i in sorted_index]
+
+        # utt list of olen
+        ys = [np.fromiter(map(int, tids[i]), dtype=np.int64)
+              for i in sorted_index]
+        ys = [to_cuda(self, Variable(torch.from_numpy(y), volatile=True)) for y in ys]
+
+        # subsample frame
+        xs = [xx[::self.subsample[0], :] for xx in xs]
+        ilens = np.fromiter((xx.shape[0] for xx in xs), dtype=np.int64)
+        hs = [to_cuda(self, Variable(torch.from_numpy(xx), volatile=True)) for xx in xs]
+
+        # encoder
+        xpad = pad_list(hs)
+        hpad, hlens = self.enc(xpad, ilens)
+
+        # decoder
+        att_ws = self.dec.calculate_all_attentions(hpad, hlens, ys)
+
+        return att_ws
 
 
 # ------------- CTC Network --------------------------------------------------------------------------------------------
@@ -415,8 +464,8 @@ class CTC(torch.nn.Module):
         y_true = torch.cat(ys).cpu().int()  # batch x olen
 
         # get length info
-        logging.info(self.__class__.__name__ + ' input lengths:  ' + str(ilens))
-        logging.info(self.__class__.__name__ + ' output lengths: ' + str(olens))
+        logging.info(self.__class__.__name__ + ' input lengths:  ' + ''.join(str(ilens).split('\n')))
+        logging.info(self.__class__.__name__ + ' output lengths: ' + ''.join(str(olens).split('\n')))
 
         # get ctc loss
         # expected shape of seqLength x batchSize x alphabet_size
@@ -1019,7 +1068,7 @@ class AttLocRec(torch.nn.Module):
         # NOTE use bmm instead of sum(*)
         c = torch.sum(self.enc_h * w.view(batch, self.h_length, 1), dim=1)
 
-        return c, (att_prev, (att_h, att_c))
+        return c, (w, (att_h, att_c))
 
 
 class AttCovLoc(torch.nn.Module):
@@ -1581,7 +1630,7 @@ class Decoder(torch.nn.Module):
         self.decoder += [torch.nn.LSTMCell(dunits + eprojs, dunits)]
         for l in six.moves.range(1, self.dlayers):
             self.decoder += [torch.nn.LSTMCell(dunits, dunits)]
-        self.ignore_id = 0  # NOTE: 0 for CTC?
+        self.ignore_id = -1
         self.output = torch.nn.Linear(dunits, odim)
 
         self.loss = None
@@ -1657,7 +1706,7 @@ class Decoder(torch.nn.Module):
         # -1: eos, which is removed in the loss computation
         self.loss *= (np.mean([len(x) for x in ys_in]) - 1)
         acc = th_accuracy(y_all, pad_ys_out, ignore_label=self.ignore_id)
-        logging.info('att loss:' + str(self.loss.data))
+        logging.info('att loss:' + ''.join(str(self.loss.data).split('\n')))
 
         # show predicted character sequence for debug
         if self.verbose > 0 and self.char_list is not None:
@@ -1847,6 +1896,73 @@ class Decoder(torch.nn.Module):
 
         # remove sos
         return nbest_hyps
+
+    def calculate_all_attentions(self, hpad, hlen, ys):
+        '''Calculate all of attentions
+
+        :return: numpy array format attentions
+        '''
+        hpad = mask_by_length(hpad, hlen, 0)
+        self.loss = None
+        # prepare input and output word sequences with sos/eos IDs
+        eos = Variable(ys[0].data.new([self.eos]))
+        sos = Variable(ys[0].data.new([self.sos]))
+        ys_in = [torch.cat([sos, y], dim=0) for y in ys]
+        ys_out = [torch.cat([y, eos], dim=0) for y in ys]
+
+        # padding for ys with -1
+        # pys: utt x olen
+        pad_ys_in = pad_list(ys_in, self.eos)
+        pad_ys_out = pad_list(ys_out, self.ignore_id)
+
+        # get length info
+        olength = pad_ys_out.size(1)
+
+        # initialization
+        c_list = [self.zero_state(hpad)]
+        z_list = [self.zero_state(hpad)]
+        for l in six.moves.range(1, self.dlayers):
+            c_list.append(self.zero_state(hpad))
+            z_list.append(self.zero_state(hpad))
+        att_w = None
+        att_ws = []
+        self.att.reset()  # reset pre-computation of h
+
+        # pre-computation of embedding
+        eys = self.embed(pad_ys_in)  # utt x olen x zdim
+
+        # loop for an output sequence
+        for i in six.moves.range(olength):
+            att_c, att_w = self.att(hpad, hlen, z_list[0], att_w)
+            ey = torch.cat((eys[:, i, :], att_c), dim=1)  # utt x (zdim + hdim)
+            z_list[0], c_list[0] = self.decoder[0](ey, (z_list[0], c_list[0]))
+            for l in six.moves.range(1, self.dlayers):
+                z_list[l], c_list[l] = self.decoder[l](
+                    z_list[l - 1], (z_list[l], c_list[l]))
+            att_ws.append(att_w)
+
+        # convert to numpy array with the shape (B, Lmax, Tmax)
+        if isinstance(self.att, AttLoc2D):
+            # att_ws => list of previous concate attentions
+            att_ws = torch.stack([aw[:, -1] for aw in att_ws], dim=1).data.cpu().numpy()
+        elif isinstance(self.att, (AttCov, AttCovLoc)):
+            # att_ws => list of list of previous attentions
+            att_ws = torch.stack([aw[-1] for aw in att_ws], dim=1).data.cpu().numpy()
+        elif isinstance(self.att, AttLocRec):
+            # att_ws => list of tuple of attention and hidden states
+            att_ws = torch.stack([aw[0] for aw in att_ws], dim=1).data.cpu().numpy()
+        elif isinstance(self.att, (AttMultiHeadDot, AttMultiHeadAdd, AttMultiHeadLoc, AttMultiHeadMultiResLoc)):
+            # att_ws => list of list of each head attetion
+            n_heads = len(att_ws[0])
+            att_ws_sorted_by_head = []
+            for h in six.moves.range(n_heads):
+                att_ws_head = torch.stack([aw[h] for aw in att_ws], dim=1)
+                att_ws_sorted_by_head += [att_ws_head]
+            att_ws = torch.stack(att_ws_sorted_by_head, dim=1).data.cpu().numpy()
+        else:
+            # att_ws => list of attetions
+            att_ws = torch.stack(att_ws, dim=1).data.cpu().numpy()
+        return att_ws
 
 
 # ------------- Encoder Network ----------------------------------------------------------------------------------------
