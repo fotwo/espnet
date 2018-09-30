@@ -29,6 +29,7 @@ def make_arg(**kwargs):
         mtlalpha=0.5,
         lsm_type="",
         lsm_weight=0.0,
+        sampling_probability=0.0,
         adim=320,
         dropout_rate=0.0,
         nbest=5,
@@ -57,10 +58,10 @@ def init_chainer_weight_const(m, val):
 
 
 @pytest.mark.parametrize(("etype", "m_str", "text_idx1"), [
-    ("blstmp", "e2e_asr_attctc", 0),
-    ("blstmp", "e2e_asr_attctc_th", 1),
-    ("vggblstmp", "e2e_asr_attctc", 2),
-    ("vggblstmp", "e2e_asr_attctc_th", 3),
+    ("blstmp", "e2e_asr", 0),
+    ("blstmp", "e2e_asr_th", 1),
+    ("vggblstmp", "e2e_asr", 2),
+    ("vggblstmp", "e2e_asr_th", 3),
 ])
 def test_recognition_results(etype, m_str, text_idx1):
     const = 1e-4
@@ -99,10 +100,10 @@ def test_recognition_results(etype, m_str, text_idx1):
 
 
 @pytest.mark.parametrize(("etype", "m_str", "text_idx1"), [
-    ("blstmp", "e2e_asr_attctc", 0),
-    ("blstmp", "e2e_asr_attctc_th", 1),
-    ("vggblstmp", "e2e_asr_attctc", 2),
-    ("vggblstmp", "e2e_asr_attctc_th", 3),
+    ("blstmp", "e2e_asr", 0),
+    ("blstmp", "e2e_asr_th", 1),
+    ("vggblstmp", "e2e_asr", 2),
+    ("vggblstmp", "e2e_asr_th", 3),
 ])
 def test_recognition_results_with_lm(etype, m_str, text_idx1):
     const = 1e-4
@@ -123,12 +124,12 @@ def test_recognition_results_with_lm(etype, m_str, text_idx1):
 
         if "_th" in m_str:
             rnnlm = lm_pytorch.ClassifierWithState(
-                lm_pytorch.RNNLM(len(args.char_list), 10))
+                lm_pytorch.RNNLM(len(args.char_list), 2, 10))
             init_torch_weight_const(model, const)
             init_torch_weight_const(rnnlm, const)
         else:
             rnnlm = lm_chainer.ClassifierWithState(
-                lm_chainer.RNNLM(len(args.char_list), 10))
+                lm_chainer.RNNLM(len(args.char_list), 2, 10))
             init_chainer_weight_const(model, const)
             init_chainer_weight_const(rnnlm, const)
 

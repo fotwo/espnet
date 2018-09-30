@@ -1,12 +1,11 @@
-ARG FROM_IMAGE
+FROM ubuntu:16.04
+LABEL maintainer "Nelson Yalta <nyalta21@gmail.com>"
 
-#For cuda-based images, The distribution will include cuda, cudnn, nccl
-FROM ${FROM_IMAGE}
+ENV DOCKER_BUILT_VER 18.06.0-ce
 
-ARG WITH_PROXY
-ENV HTTP_PROXY ${WITH_PROXY}
-ENV HTTPS_PROXY ${WITH_PROXY}
-ENV CUDA_HOME /usr/local/cuda
+ARG NUM_BUILD_CORES=8
+ENV NUM_BUILD_CORES ${NUM_BUILD_CORES}
+
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get -y install --no-install-recommends \ 
         automake \
         autoconf \
@@ -24,16 +23,20 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get -y install --no-ins
         libfreetype6-dev \
         libperl-dev \ 
         libpng12-dev \
+        libprotobuf-dev \
+        libprotobuf9v5 \
         libsndfile1 \
         libsndfile-dev \
         libtool \
         libzmq3-dev \ 
-        perl \
         pciutils \
+        perl \
         pkg-config \
+        protobuf-compiler \
         python-dev \
         python-tk \
-        python-numpy-dev \ 
+        python-numpy-dev \
+        python3-numpy-dev \ 
         software-properties-common \
         sox \
         subversion \
@@ -48,10 +51,6 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get -y install --no-ins
         libgcc-5-dev \
         libstdc++-5-dev \
         && \
-    apt-get -y install --reinstall \
-        libnccl-dev \
-        libnccl2 \
-        && \
     add-apt-repository ppa:deadsnakes/ppa && \
     apt-get update && apt-get -y install --no-install-recommends \
         python3.6 \
@@ -60,25 +59,26 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get -y install --no-ins
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+
 # Install pip
 RUN curl -fSsL -O https://bootstrap.pypa.io/get-pip.py && \
     python get-pip.py && \
     rm get-pip.py
-RUN pip install -U soundfile virtualenv
+RUN pip install -U virtualenv
 
-# Install espnet
-RUN mkdir -p /espnet
-COPY ./tools /espnet/tools
+# Install Kaldi
+RUN git clone https://github.com/kaldi-asr/kaldi
 
-WORKDIR /espnet/tools
-RUN make kaldi USE_VENV=OFF && \
-    rm -r ./kaldi/tools/openfst-1.6.5/src && \
-    find ./kaldi/src -name "*.o" -exec rm -f {} \; && \
-    find ./kaldi/src -name "*.o" -exec rm -f {} \; && \
-    cd kaldi/tools && ./extras/install_beamformit.sh
+RUN cd /kaldi/tools && \
+    make all && \
+    rm -r openfst-*/src && \
+    ./extras/install_beamformit.sh && \
+    ./extras/install_irstlm.sh && \
+    cd /kaldi/src && \
+    ./configure --shared --use-cuda=no && \
+    make depend -j${NUM_BUILD_CORES} && \
+    make -j${NUM_BUILD_CORES} && \
+    find /kaldi/src -name "*.o" -exec rm -f {} \; && \
+    find /kaldi/src -name "*.o" -exec rm -f {} \; 
 
-RUN make nkf USE_VENV=OFF && make kaldi-io-for-python USE_VENV=OFF
-RUN make venv/lib/python2.7/site-packages/torch USE_VENV=OFF && make warp-ctc USE_VENV=OFF
-RUN make chainer_ctc USE_VENV=OFF && make subword-nmt USE_VENV=OFF
 WORKDIR /
-
