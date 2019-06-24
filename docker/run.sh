@@ -3,6 +3,11 @@
 docker_gpu=0
 docker_egs=
 docker_folders=
+docker_cuda=10.0
+docker_user=true
+docker_env=
+docker_cmd=
+docker_os=u18
 
 while test $# -gt 0
 do
@@ -14,15 +19,15 @@ do
         --docker*) ext=${1#--}
               frombreak=true
               for i in _ {a..z} {A..Z}; do
-                for var in `eval echo "\\${!$i@}"`; do
+                for var in `eval echo "\\${!${i}@}"`; do
                   if [ "$var" == "$ext" ]; then
-                    eval $ext=$2
+                    eval ${ext}=$2
                     frombreak=false
                     break 2
                   fi 
                 done 
               done
-              if $frombreak ; then
+              if ${frombreak} ; then
                 echo "bad option $1" 
                 exit 1
               fi
@@ -39,44 +44,66 @@ if [ -z "${docker_egs}" ]; then
   exit 1
 fi
 
-from_image="ubuntu:16.04"
-image_label="espnet:ubuntu16.04"
+from_tag="cpu"
 if [ ! "${docker_gpu}" == "-1" ]; then
-  cuda_ver=$( nvcc -V | grep release )
-  cuda_ver=${cuda_ver#*"release "}
-  cuda_ver=${cuda_ver%,*}
-  if [ ! -z "${cuda_ver}" ]; then
-    cudnn_ver=$( cat /usr/local/cuda/include/cudnn.h | grep "#define CUDNN_MAJOR" )
-    cudnn_ver=${cudnn_ver#*MAJOR}
-    cudnn_ver=${cudnn_ver// /}
-    if [ ! -z "${cudnn_ver}" ]; then
-      from_image="nvidia/cuda:${cuda_ver}-cudnn${cudnn_ver}-devel-ubuntu16.04"
-      image_label="espnet:cuda${cuda_ver}-cudnn${cudnn_ver}-ubuntu16.04"
-    else
-      echo "CUDNN was not found in default folder."
-      from_image="nvidia/cuda:${cuda_ver}-devel-ubuntu16.04"
-      image_label="espnet:cuda${cuda_ver}-ubuntu16.04"
-    fi
+  if [ -z "${docker_cuda}" ]; then
+    # If the docker_cuda is not set, the program will automatically 
+    # search the installed version with default configurations (apt)
+    docker_cuda=$( nvcc -V | grep release )
+    docker_cuda=${docker_cuda#*"release "}
+    docker_cuda=${docker_cuda%,*}
+  fi
+  # After search for your cuda version, if the variable docker_cuda is empty the program will raise an error
+  if [ -z "${docker_cuda}" ]; then
+    echo "CUDA was not found in your system. Use CPU image or install NVIDIA-DOCKER, CUDA and NVCC for GPU image."
+    exit 1
   else
-    echo "CUDA version was not found, selecting CPU image. For GPU image, install NVIDIA-DOCKER, CUDA and NVCC."
+    from_tag="gpu-cuda${docker_cuda}-cudnn7"
   fi
 fi
-echo "Using image ${from_image}."
-build_args="--build-arg FROM_IMAGE=${from_image}"
-if [ ! -z "${HTTP_PROXY}" ]; then
-  echo "Building with proxy ${HTTP_PROXY}"
-  build_args="${build_args} --build-arg WITH_PROXY=${HTTP_PROXY}"
-fi 
 
-docker_image=$( docker images -q ${image_label} ) 
-
-cd ..
-if ! [[ -n ${docker_image}  ]]; then
-  echo "Building docker image..."
-  (docker build ${build_args} -f docker/espnet.devel -t ${image_label} .) || exit 1
+if [ ! -z "${docker_os}" ]; then
+  from_tag="${from_tag}-${docker_os}"
 fi
 
-vols="-v $PWD/egs:/espnet/egs -v $PWD/src:/espnet/src -v $PWD/test:/espnet/test"
+# Check if image exists in the system and download if required
+docker_image=$( docker images -q espnet/espnet:${from_tag} )
+if ! [[ -n ${docker_image}  ]]; then
+  docker pull espnet/espnet:${from_tag}
+fi
+
+if [ ${docker_user} = true ]; then
+  # Build a container with the user account
+  container_tag="${from_tag}-user-${HOME##*/}"
+  docker_image=$( docker images -q espnet/espnet:${container_tag} ) 
+  if ! [[ -n ${docker_image}  ]]; then
+    echo "Building docker image..."
+    build_args="--build-arg FROM_TAG=${from_tag}"
+    build_args="${build_args} --build-arg THIS_USER=${HOME##*/}"
+    build_args="${build_args} --build-arg THIS_UID=${UID}"
+
+    echo "Now running docker build ${build_args} -f prebuilt/Dockerfile -t espnet/espnet:${container_tag} ."
+    (docker build ${build_args} -f prebuilt/Dockerfile -t  espnet/espnet:${container_tag} .) || exit 1
+  fi
+else
+  container_tag=${from_tag}
+fi
+
+echo "Using image espnet/espnet:${container_tag}."
+
+this_time="$(date '+%Y%m%dT%H%M')"
+if [ "${docker_gpu}" == "-1" ]; then
+  cmd0="docker"
+  container_name="espnet_cpu_${this_time}"
+else
+  # --rm erase the container when the training is finished.
+  cmd0="NV_GPU='${docker_gpu}' nvidia-docker"
+  container_name="espnet_gpu${docker_gpu//,/_}_${this_time}"
+fi
+
+cd ..
+
+vols="-v ${PWD}/egs:/espnet/egs -v ${PWD}/espnet:/espnet/espnet -v ${PWD}/test:/espnet/test -v ${PWD}/utils:/espnet/utils"
 if [ ! -z "${docker_folders}" ]; then
   docker_folders=$(echo ${docker_folders} | tr "," "\n")
   for i in ${docker_folders[@]}
@@ -86,20 +113,50 @@ if [ ! -z "${docker_folders}" ]; then
 fi
 
 cmd1="cd /espnet/egs/${docker_egs}"
-cmd2="./run.sh $@"
-#Required to access to the folder once the training if finished
-cmd3="chmod -R 777 /espnet/egs/${docker_egs}"
-
-cmd="${cmd1}; ${cmd2}; ${cmd3}"
-if [ "${docker_gpu}" == "-1" ]; then
-  cmd="docker run -i --rm --name espnet_cpu ${vols} ${image_label} /bin/bash -c '${cmd}'"
+if [ ! -z "${docker_cmd}" ]; then
+  cmd2="./${docker_cmd} $@"
 else
-  # --rm erase the container when the training is finished.
-  cmd="NV_GPU='${docker_gpu}' nvidia-docker run -i --rm --name espnet_gpu${docker_gpu} ${vols} ${image_label} /bin/bash -c '${cmd}'"
+  cmd2="./run.sh $@"
 fi
+
+if [ ${docker_user} = false ]; then
+  # Required to access to the folder once the training if finished in root access
+  cmd2="${cmd2}; chmod -R 777 /espnet/egs/${docker_egs}"
+fi
+
+cmd="${cmd1}; ${cmd2}"
+this_env=""
+if [ ! -z "${docker_env}" ]; then
+  docker_env=$(echo ${docker_env} | tr "," "\n")
+  for i in ${docker_env[@]}
+  do
+    this_env="-e $i ${this_env}" 
+  done
+fi
+
+if [ ! -z "${HTTP_PROXY}" ]; then
+  this_env="${this_env} -e 'HTTP_PROXY=${HTTP_PROXY}'"
+fi
+
+if [ ! -z "${http_proxy}" ]; then
+  this_env="${this_env} -e 'http_proxy=${http_proxy}'"
+fi
+
+cmd="${cmd0} run -i --rm ${this_env} --name ${container_name} ${vols} espnet/espnet:${container_tag} /bin/bash -c '${cmd}'"
+
+trap ctrl_c INT
+
+function ctrl_c() {
+        echo "** Kill docker container ${container_name}"
+        docker rm -f ${container_name}
+}
 
 echo "Executing application in Docker"
 echo ${cmd}
-eval ${cmd}
+eval ${cmd} &
+PROC_ID=$!
 
+while kill -0 "$PROC_ID" 2> /dev/null; do
+    sleep 1
+done
 echo "`basename $0` done."

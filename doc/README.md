@@ -6,7 +6,7 @@ We use [travis-sphinx](https://github.com/Syntaf/travis-sphinx) to generate & de
 
 ```sh
 $ cd <espnet_root>
-$ pip install -r doc/requirements.txt
+$ pip install -e ".[doc]"
 ```
 
 ## Generate HTML
@@ -14,20 +14,11 @@ $ pip install -r doc/requirements.txt
 You can generate local HTML manually using sphinx Makefile
 
 ```sh
-$ cd <espnet_root>/doc
-$ make html
-```
-
-`index.html` will be created at `doc/_build/html/index.html`
-
-or using travis-sphinx
-
-```sh
 $ cd <espnet_root>
-$ travis-sphinx build --source=doc --nowarn
+$ ./ci/doc.sh
 ```
 
-`index.html` will be created at `doc/build/index.html`
+open `doc/build/html/index.html`
 
 ## Deploy
 
